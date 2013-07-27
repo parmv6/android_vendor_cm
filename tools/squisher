@@ -32,60 +32,93 @@ fi
 
 OPTICHARGER=$ANDROID_BUILD_TOP/vendor/cm/tools/opticharger
 QUIET=-q
+DELETE_BINS="applypatch applypatch_static check_prereq recovery updater"
+
 REPACK=$OUT/repack.d
-if [ -d $REPACK ]; then
-	printf "Sanitizing environment..."
-	rm -rf $REPACK
-	echo
-fi
+printf "Sanitizing environment..."
+rm -rf $REPACK
+mkdir -p $REPACK
+echo
+
 
 # Unpack the otapackage and opticharge all apks
-mkdir -p $REPACK/ota
+mkdir $REPACK/ota
 (
 cd $REPACK/ota
 printf "Unpacking $OTAPACKAGE..."
 unzip $QUIET $OTAPACKAGE
 echo
 
-# Move all apks to parallel folder so that xargs can process them together
-APKFOLDERS="
-extras/app
-extras/priv-app
-system/app
-system/priv-app
-system/framework
-"
-
+# Move all apks to the same directory so xargs can
+# use also with framework-res.apk. This allow process
+# framework-res.apk in parallel with other apks
 mkdir -p $REPACK/parallel
+mkdir -p $REPACK/parallel/app
+mkdir -p $REPACK/parallel/priv-app
 cd $REPACK/parallel
-for i in $APKFOLDERS; do
-    if ls $REPACK/ota/$i/*.apk >/dev/null 2>&1; then
-        mkdir -p $REPACK/parallel/$i
-        cp $REPACK/ota/$i/*.apk $REPACK/parallel/$i/
-    fi
-done
+cp $REPACK/ota/system/framework/framework-res.apk .
+cp $REPACK/ota/system/app/*.apk ./app
+cp $REPACK/ota/system/priv-app/*.apk ./priv-app
 
 # Do optimization in parallel
 find ./ -name \*.apk | $XARGS $OPTICHARGER
 
 # Move optimized apks to repack directory
-for i in $APKFOLDERS; do
-    if ls $REPACK/parallel/$i/*.apk >/dev/null 2>&1; then
-        mv -f $REPACK/parallel/$i/*.apk $REPACK/ota/$i/
-    fi
-done
+mv -f $REPACK/parallel/framework-res.apk $REPACK/ota/system/framework/framework-res.apk
+mv -f $REPACK/parallel/app/*.apk $REPACK/ota/system/app/
+mv -f $REPACK/parallel/priv-app/*.apk $REPACK/ota/system/priv-app/
 
 # Return to directory
 cd $REPACK/ota
 rm -rf $REPACK/parallel
 )
 
-# Pack it up
+# Fix build.prop
+$SED -i \
+	-e '/ro\.kernel\.android\.checkjni/d' \
+	-e '/ro\.build\.type/s/eng/user/' \
+	$REPACK/ota/system/build.prop
+
+
+# Delete unnecessary binaries
+( cd $REPACK/ota/system/bin; echo $DELETE_BINS | xargs rm -f; )
+
+# No need for recovery
+rm -rf $REPACK/ota/recovery
+
+# Strip modules
+[ -d $REPACK/ota/system/lib/modules ] && \
+	find $REPACK/ota/system/lib/modules -name "*.ko" -print0 | xargs -0 arm-eabi-strip --strip-unneeded
+
+# Determine what to name the new signed package
+MODVERSION=`sed -n -e'/ro\.cm\.version/s/^.*=//p' $REPACK/ota/system/build.prop`
+OUTFILE=$OUT/cm-$MODVERSION.zip
+echo -e $CL_CYN"MODVERSION: $MODVERSION"$CL_RST
+
+# Pack it up and sign
 printf "Zipping package..."
-( cd $REPACK/ota; zip $QUIET -r $REPACK/update.zip .; mv -f $REPACK/update.zip $OTAPACKAGE )
+( cd $REPACK/ota; zip $QUIET -r $REPACK/update.zip . )
+echo
+printf "Signing package..."
+SECURITYDIR=$ANDROID_BUILD_TOP/build/target/product/security
+java -Xmx1024m \
+	-jar $OUT/../../../host/$OUT_TARGET_HOST/framework/signapk.jar \
+	-w $SECURITYDIR/testkey.x509.pem $SECURITYDIR/testkey.pk8 \
+	$REPACK/update.zip $OUTFILE
 echo
 printf "Cleaning up..."
 rm -rf $REPACK
 echo
+
+# Create a md5 checksum image of the repacked package
+(
+img=`basename $OUTFILE`
+cd `dirname $OUTFILE`
+$MD5 $img >$img.md5sum
+echo
+echo -e $CL_GRN"Package complete: $OUTFILE"$CL_RST
+cat $img.md5sum
+echo
+)
 
 exit 0
